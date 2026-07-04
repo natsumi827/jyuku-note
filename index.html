@@ -52,9 +52,9 @@ const uid = (p) => `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}
 
 /* ---------- data factories ---------- */
 const emptyClass = (name) => ({ id: uid("c"), name, testDate: "", testLabel: "", entries: [], students: [], testResults: [] });
-const emptyStudent = (name) => ({ id: uid("st"), name });
+const emptyStudent = (name) => ({ id: uid("st"), name, notes: "" });
 const emptyEntry = () => ({ id: uid("e"), date: new Date().toISOString().slice(0, 10), content: "", homework: "", nextContent: "" });
-const emptySubject = () => ({ id: uid("s"), name: "", score: "", maxScore: "100", topic: "", aiAdvice: "" });
+const emptySubject = () => ({ id: uid("s"), name: "", score: "", maxScore: "100", topic: "", aiAdvice: "", nationalAvg: "", deviation: "", rank: "" });
 const emptyTestResult = (studentId) => ({ id: uid("t"), studentId, name: "", date: new Date().toISOString().slice(0, 10), subjects: [emptySubject()] });
 
 /* ---------- storage (localStorage — persists only in this browser) ---------- */
@@ -281,6 +281,36 @@ function EntryCard({ entry, accent, onEdit, onDelete }) {
   );
 }
 
+function StudentNoteEditor({ student, accent, onSave }) {
+  const [text, setText] = useState(student.notes || "");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => { setText(student.notes || ""); setSaved(false); }, [student.id]);
+
+  const handleBlur = () => { onSave(student.id, text); setSaved(true); setTimeout(() => setSaved(false), 1500); };
+
+  return (
+    <div className="rounded-lg p-4 mb-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+      <div className="flex items-center justify-between mb-2">
+        <label className="text-xs font-bold" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>
+          <Icon size={12} style={{ marginRight: 4 }}>📋</Icon>{student.name}の授業態度・特徴
+        </label>
+        {saved && <span className="text-xs" style={{ color: PALETTE.good, ...FONT_JP }}>保存しました</span>}
+      </div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={handleBlur}
+        rows={3}
+        placeholder="例）集中力はあるが計算ミスが多い。質問には積極的。前に座らせると集中しやすい。"
+        className="w-full px-2 py-1.5 rounded text-sm resize-none"
+        style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }}
+      />
+      <div className="text-[10px] mt-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>入力欄から離れると自動で保存されます。</div>
+    </div>
+  );
+}
+
 function TestResultForm({ initial, accent, onSave, onCancel }) {
   const [result, setResult] = useState(initial);
   const updateField = (field) => (e) => setResult((prev) => ({ ...prev, [field]: e.target.value }));
@@ -312,7 +342,21 @@ function TestResultForm({ initial, accent, onSave, onCancel }) {
               <input type="number" value={s.maxScore} onChange={updateSubject(s.id, "maxScore")} placeholder="満点" className="w-20 px-2 py-1.5 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
               <button onClick={() => removeSubject(s.id)} disabled={result.subjects.length <= 1} className="p-1 disabled:opacity-30" style={{ color: PALETTE.stamp }}><Icon size={14}>🗑️</Icon></button>
             </div>
-            <input type="text" value={s.topic} onChange={updateSubject(s.id, "topic")} placeholder="苦手だった範囲・単元（任意、例：二次方程式の文章題）" className="w-full px-2 py-1.5 rounded text-xs" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+            <input type="text" value={s.topic} onChange={updateSubject(s.id, "topic")} placeholder="苦手だった範囲・単元（任意、例：二次方程式の文章題）" className="w-full px-2 py-1.5 rounded text-xs mb-2" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+            <div className="grid grid-cols-3 gap-2">
+              <div>
+                <label className="block text-[10px] mb-0.5" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>全国平均（任意）</label>
+                <input type="number" value={s.nationalAvg} onChange={updateSubject(s.id, "nationalAvg")} placeholder="例）62" className="w-full px-2 py-1 rounded text-xs" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+              </div>
+              <div>
+                <label className="block text-[10px] mb-0.5" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>偏差値（任意）</label>
+                <input type="number" value={s.deviation} onChange={updateSubject(s.id, "deviation")} placeholder="例）58.2" className="w-full px-2 py-1 rounded text-xs" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+              </div>
+              <div>
+                <label className="block text-[10px] mb-0.5" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>全国順位（任意）</label>
+                <input type="text" value={s.rank} onChange={updateSubject(s.id, "rank")} placeholder="例）350/12000人" className="w-full px-2 py-1 rounded text-xs" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+              </div>
+            </div>
           </div>
         ))}
       </div>
@@ -365,6 +409,26 @@ function TestResultAnalysis({ result, onEdit, onDelete, onGenerateAdvice, hasApi
               <div className="w-full h-2 rounded-full" style={{ background: PALETTE.line }}>
                 <div className="h-2 rounded-full" style={{ width: `${Math.min(r.pct, 100)}%`, background: meta.color }} />
               </div>
+              {(r.nationalAvg !== "" || r.deviation !== "" || (r.rank && r.rank.trim())) && (
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] mt-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>
+                  {r.nationalAvg !== "" && (() => {
+                    const avgPct = pct(r.nationalAvg, r.maxScore);
+                    const diff = avgPct !== null ? Math.round((r.pct - avgPct) * 10) / 10 : null;
+                    return (
+                      <span>
+                        全国平均 {r.nationalAvg}点
+                        {diff !== null && (
+                          <span style={{ color: diff >= 0 ? PALETTE.good : PALETTE.stamp, fontWeight: 600 }}>
+                            （{diff >= 0 ? "+" : ""}{diff}点）
+                          </span>
+                        )}
+                      </span>
+                    );
+                  })()}
+                  {r.deviation !== "" && <span>偏差値 {r.deviation}</span>}
+                  {r.rank && r.rank.trim() && <span>全国 {r.rank}</span>}
+                </div>
+              )}
             </div>
           );
         })}
@@ -414,9 +478,16 @@ function ScoreTrendChart({ testResults }) {
   }, [sorted]);
   const chartData = useMemo(() => sorted.map((t) => {
     const point = { test: t.name || formatDateJP(t.date) };
-    t.subjects.forEach((s) => { if (!s.name.trim()) return; const p = pct(s.score, s.maxScore); if (p !== null) point[s.name.trim()] = p; });
+    t.subjects.forEach((s) => {
+      if (!s.name.trim()) return;
+      const p = pct(s.score, s.maxScore);
+      if (p !== null) point[s.name.trim()] = p;
+      const avgP = pct(s.nationalAvg, s.maxScore);
+      if (avgP !== null) point[s.name.trim() + "__avg"] = avgP;
+    });
     return point;
   }), [sorted]);
+  const hasAnyAvg = useMemo(() => chartData.some((d) => Object.keys(d).some((k) => k.endsWith("__avg"))), [chartData]);
 
   if (sorted.length < 2 || subjectNames.length === 0) {
     return <div className="text-center py-8 text-sm rounded-lg mb-4" style={{ color: PALETTE.inkSoft, border: `1px dashed ${PALETTE.line}`, ...FONT_JP }}>テスト結果を2件以上登録すると、成績の推移グラフが表示されます。</div>;
@@ -445,8 +516,12 @@ function ScoreTrendChart({ testResults }) {
         {subjectNames.map((name, si) => {
           const color = SUBJECT_COLORS[si % SUBJECT_COLORS.length];
           const pts = chartData.map((d, i) => (d[name] !== undefined ? { x: xScale(i), y: yScale(d[name]) } : null)).filter(Boolean);
+          const avgPts = chartData.map((d, i) => (d[name + "__avg"] !== undefined ? { x: xScale(i), y: yScale(d[name + "__avg"]) } : null)).filter(Boolean);
           return (
             <g key={name}>
+              {avgPts.length > 0 && (
+                <polyline points={avgPts.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth="1.5" strokeDasharray="4 3" opacity="0.6" />
+              )}
               <polyline points={pts.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth="2" />
               {pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r="3" fill={color} />)}
             </g>
@@ -461,6 +536,9 @@ function ScoreTrendChart({ testResults }) {
           </div>
         ))}
       </div>
+      {hasAnyAvg && (
+        <div className="text-[10px] mt-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>実線：本人の得点　点線：全国平均</div>
+      )}
     </div>
   );
 }
@@ -527,6 +605,7 @@ function App() {
 
   const addStudent = (name) => { const s = emptyStudent(name); updateClass(selectedClassId, (c) => ({ ...c, students: [...c.students, s] })); setSelectedStudentId(s.id); };
   const renameStudent = (id, name) => updateClass(selectedClassId, (c) => ({ ...c, students: c.students.map((s) => (s.id === id ? { ...s, name } : s)) }));
+  const saveStudentNotes = (id, notes) => updateClass(selectedClassId, (c) => ({ ...c, students: c.students.map((s) => (s.id === id ? { ...s, notes } : s)) }));
   const deleteStudent = (id) => updateClass(selectedClassId, (c) => ({ ...c, students: c.students.filter((s) => s.id !== id), testResults: c.testResults.filter((t) => t.studentId !== id) }));
 
   const handleSaveEntry = (entry) => {
@@ -619,6 +698,11 @@ function App() {
 
                 {selectedStudentId && (
                   <>
+                    <StudentNoteEditor
+                      student={selectedClass.students.find((s) => s.id === selectedStudentId)}
+                      accent={accent}
+                      onSave={saveStudentNotes}
+                    />
                     {testFormState === null ? (
                       <button onClick={() => setTestFormState(emptyTestResult(selectedStudentId))} className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-lg mb-4 text-sm text-white" style={{ background: accent, ...FONT_JP }}><Icon size={16}>➕</Icon> テスト結果を追加</button>
                     ) : <TestResultForm initial={testFormState} accent={accent} onSave={handleSaveTestResult} onCancel={() => setTestFormState(null)} />}
