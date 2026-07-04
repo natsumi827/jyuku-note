@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>塾講師ノート</title>
+<meta name="description" content="通常授業と夏期講習を分けて、クラス・生徒ごとに授業記録とテスト成績を管理するアプリ" />
+<link rel="icon" href="data:,">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700&family=Noto+Sans+JP:wght@400;500;700&display=swap');
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* ---------- design tokens ---------- */
+const PALETTE = {
+  ink: "#22314F", inkSoft: "#4C5B7A", paper: "#FAF7F1", paperCard: "#FFFFFF",
+  line: "#E4DFD3", stamp: "#B23A32", stampSoft: "#F1E1DE", gold: "#C7972B",
+  good: "#2E7D5B", goodSoft: "#E4F1EB", warn: "#B23A32", warnSoft: "#F5E4E2",
+  mid: "#8A7A3E", midSoft: "#F1EBDA", summerSky: "#2E7D8C", summerSkySoft: "#E1EEEF",
+};
+const SUBJECT_COLORS = ["#22314F", "#B23A32", "#2E7D8C", "#C7972B", "#6B4E8E", "#2E7D5B", "#A15C2E"];
+const MODES = {
+  normal: { label: "通常授業", accent: PALETTE.ink, soft: "#EEF1F6", emoji: "📘" },
+  summer: { label: "夏期講習", accent: PALETTE.summerSky, soft: PALETTE.summerSkySoft, emoji: "🔥" },
+};
+const FONT_JP = { fontFamily: "'Noto Sans JP', sans-serif" };
+const FONT_MINCHO = { fontFamily: "'Shippori Mincho', serif" };
+
+/* simple emoji-based icon, avoids external icon library */
+function Icon({ children, size = 14, style }) {
+  return <span style={{ fontSize: size, lineHeight: 1, display: "inline-block", ...style }}>{children}</span>;
+}
+
+const uid = (p) => `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+/* ---------- data factories ---------- */
+const emptyClass = (name) => ({ id: uid("c"), name, testDate: "", testLabel: "", entries: [], students: [], testResults: [] });
+const emptyStudent = (name) => ({ id: uid("st"), name });
+const emptyEntry = () => ({ id: uid("e"), date: new Date().toISOString().slice(0, 10), content: "", homework: "", nextContent: "" });
+const emptySubject = () => ({ id: uid("s"), name: "", score: "", maxScore: "100", topic: "", aiAdvice: "" });
+const emptyTestResult = (studentId) => ({ id: uid("t"), studentId, name: "", date: new Date().toISOString().slice(0, 10), subjects: [emptySubject()] });
+
+/* ---------- storage (localStorage — persists only in this browser) ---------- */
+function storageKey(mode) { return `jukunote:${mode}`; }
+
+function migrateModeData(parsed) {
+  if (parsed && Array.isArray(parsed.classes)) {
+    return { classes: parsed.classes.map((c) => ({ testDate: "", testLabel: "", entries: [], students: [], testResults: [], ...c })) };
+  }
+  if (parsed && (Array.isArray(parsed.entries) || Array.isArray(parsed.testResults))) {
+    const defaultStudent = emptyStudent("生徒1");
+    return {
+      classes: [{
+        id: uid("c"), name: "クラス1",
+        testDate: parsed.testDate || "", testLabel: parsed.testLabel || "",
+        entries: (parsed.entries || []).map(({ className, ...rest }) => rest),
+        students: [defaultStudent],
+        testResults: (parsed.testResults || []).map((t) => ({ ...t, studentId: defaultStudent.id })),
+      }],
+    };
+  }
+  return { classes: [] };
+}
+
+function loadMode(mode) {
+  try {
+    const raw = localStorage.getItem(storageKey(mode));
+    if (raw) return migrateModeData(JSON.parse(raw));
+  } catch (e) { /* ignore corrupt data */ }
+  return { classes: [] };
+}
+function saveMode(mode, data) {
+  try { localStorage.setItem(storageKey(mode), JSON.stringify(data)); }
+  catch (e) { console.error("保存に失敗しました", e); }
+}
+
+/* ---------- Anthropic API (bring-your-own key, stored only in this browser) ---------- */
+function getApiKey() { return localStorage.getItem("jukunote:apiKey") || ""; }
+function setApiKey(key) { localStorage.setItem("jukunote:apiKey", key); }
+
+async function fetchTopicAdvice({ subjectName, topic, pctValue, score, maxScore }) {
+  const apiKey = getApiKey();
+  if (!apiKey) throw new Error("NO_API_KEY");
+  const prompt = `あなたは経験豊富な集団塾講師のアシスタントです。生徒が「${subjectName}」のテストで${score}点/${maxScore}点満点（${pctValue}%）でした。特に苦手だった範囲・単元は次の通りです：「${topic}」。\n\nこの範囲を克服するために、次の授業や宿題で取り組むべき具体的な学習対策を3つ、箇条書きで簡潔に日本語で提案してください。前置きや挨拶、まとめの文は不要です。箇条書きのみを出力してください。`;
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 500,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!response.ok) throw new Error("API_ERROR");
+  const json = await response.json();
+  const text = (json.content || []).map((b) => b.text || "").join("\n").trim();
+  if (!text) throw new Error("EMPTY_RESPONSE");
+  return text;
+}
+
+/* ---------- helpers ---------- */
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const target = new Date(dateStr + "T00:00:00");
+  return Math.round((target - today) / 86400000);
+}
+function formatDateJP(dateStr) {
+  if (!dateStr) return "";
+  const d = new Date(dateStr + "T00:00:00");
+  const days = ["日", "月", "火", "水", "木", "金", "土"];
+  return `${d.getMonth() + 1}月${d.getDate()}日(${days[d.getDay()]})`;
+}
+function pct(score, max) {
+  const s = parseFloat(score), m = parseFloat(max);
+  if (isNaN(s) || isNaN(m) || m === 0) return null;
+  return Math.round((s / m) * 1000) / 10;
+}
+function levelFor(p) { if (p === null) return null; if (p < 60) return "weak"; if (p < 80) return "mid"; return "strong"; }
+function adviceFor(p) {
+  if (p === null) return "";
+  if (p < 40) return "基礎の定着が最優先。教科書レベルの基本問題を繰り返し解いて土台を固めましょう。";
+  if (p < 60) return "苦手分野を洗い出し、基本〜標準レベルの問題演習の量を増やしましょう。";
+  if (p < 80) return "応用問題にも挑戦しつつ、ケアレスミスの見直しを徹底しましょう。";
+  return "得意分野です。応用・発展問題でさらに伸ばし、得点源として安定させましょう。";
+}
+const LEVEL_META = {
+  weak: { label: "苦手", color: PALETTE.warn, soft: PALETTE.warnSoft, emoji: "⚠️" },
+  mid: { label: "普通", color: PALETTE.mid, soft: PALETTE.midSoft, emoji: "➖" },
+  strong: { label: "得意", color: PALETTE.good, soft: PALETTE.goodSoft, emoji: "👍" },
+};
+
+/* ---------- small components ---------- */
+function CountdownStamp({ dateStr, accent }) {
+  const diff = daysUntil(dateStr);
+  if (dateStr === "" || diff === null) {
+    return <div className="flex flex-col items-center justify-center rounded-full border-2 border-dashed shrink-0" style={{ width: 108, height: 108, borderColor: PALETTE.line, color: PALETTE.inkSoft }}>
+      <span className="text-xs" style={FONT_JP}>未設定</span>
+    </div>;
+  }
+  const overdue = diff < 0, today0 = diff === 0;
+  const color = overdue ? PALETTE.inkSoft : PALETTE.stamp;
+  return (
+    <div className="flex flex-col items-center justify-center rounded-full shrink-0"
+      style={{ width: 108, height: 108, border: `3px solid ${color}`, color, transform: "rotate(-6deg)", boxShadow: `0 0 0 3px ${overdue ? "transparent" : PALETTE.stampSoft}` }}>
+      {overdue ? <span className="text-sm font-bold" style={FONT_MINCHO}>終了</span> : (
+        <>
+          <span className="text-3xl font-bold leading-none" style={FONT_MINCHO}>{today0 ? "本番" : diff}</span>
+          {!today0 && <span className="text-xs mt-1" style={FONT_JP}>日前</span>}
+        </>
+      )}
+    </div>
+  );
+}
+
+function EntityChipRow({ items, selectedId, onSelect, onAdd, onRename, onDelete, accent, addLabel, emptyHint }) {
+  const [editing, setEditing] = useState(null);
+  const [text, setText] = useState("");
+  const startAdd = () => { setEditing("new"); setText(""); };
+  const startRename = (item) => { setEditing(item); setText(item.name); };
+  const cancel = () => { setEditing(null); setText(""); };
+  const confirm = () => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (editing === "new") onAdd(trimmed); else onRename(editing.id, trimmed);
+    cancel();
+  };
+  const onKeyDown = (e) => { if (e.key === "Enter") confirm(); if (e.key === "Escape") cancel(); };
+  const selectedItem = items.find((i) => i.id === selectedId);
+  const isRenamingSelected = editing && editing !== "new" && selectedItem && editing.id === selectedItem.id;
+
+  return (
+    <div className="mb-4">
+      <div className="flex flex-wrap gap-2 items-center">
+        {items.map((item) => (
+          <button key={item.id} onClick={() => onSelect(item.id)} className="text-sm px-3 py-1.5 rounded-full"
+            style={{ background: item.id === selectedId ? accent : PALETTE.paperCard, color: item.id === selectedId ? "#fff" : PALETTE.ink, border: `1px solid ${item.id === selectedId ? accent : PALETTE.line}`, ...FONT_JP }}>
+            {item.name}
+          </button>
+        ))}
+        {editing === "new" ? (
+          <div className="flex items-center gap-1">
+            <input autoFocus value={text} onChange={(e) => setText(e.target.value)} placeholder={addLabel} onKeyDown={onKeyDown}
+              className="px-2 py-1 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+            <button onClick={confirm} style={{ color: accent }}><Icon size={16}>✅</Icon></button>
+            <button onClick={cancel} style={{ color: PALETTE.inkSoft }}><Icon size={16}>✖️</Icon></button>
+          </div>
+        ) : (
+          <button onClick={startAdd} className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-full" style={{ color: accent, border: `1px dashed ${accent}`, ...FONT_JP }}>
+            <Icon size={13}>➕</Icon> {addLabel}
+          </button>
+        )}
+      </div>
+      {items.length === 0 && emptyHint && <div className="text-xs mt-2" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>{emptyHint}</div>}
+      {selectedItem && editing !== "new" && (
+        isRenamingSelected ? (
+          <div className="flex items-center gap-1 mt-2">
+            <input autoFocus value={text} onChange={(e) => setText(e.target.value)} onKeyDown={onKeyDown}
+              className="px-2 py-1 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+            <button onClick={confirm} style={{ color: accent }}><Icon size={16}>✅</Icon></button>
+            <button onClick={cancel} style={{ color: PALETTE.inkSoft }}><Icon size={16}>✖️</Icon></button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-3 mt-2 text-xs" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>
+            <button onClick={() => startRename(selectedItem)} className="flex items-center gap-1"><Icon size={12}>✏️</Icon> 名前を変更</button>
+            <button onClick={() => onDelete(selectedItem.id)} className="flex items-center gap-1" style={{ color: PALETTE.stamp }}><Icon size={12}>🗑️</Icon> 削除</button>
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+function EntryForm({ initial, accent, onSave, onCancel }) {
+  const [entry, setEntry] = useState(initial);
+  const update = (field) => (e) => setEntry((prev) => ({ ...prev, [field]: e.target.value }));
+  return (
+    <div className="rounded-lg p-4 mb-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+      <div className="mb-3">
+        <label className="block text-xs mb-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>授業日</label>
+        <input type="date" value={entry.date} onChange={update("date")} className="px-2 py-1.5 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+      </div>
+      <div className="mb-3">
+        <label className="block text-xs mb-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>今日の授業内容</label>
+        <textarea value={entry.content} onChange={update("content")} rows={2} placeholder="例）二次関数の応用問題演習" className="w-full px-2 py-1.5 rounded text-sm resize-none" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+      </div>
+      <div className="mb-3">
+        <label className="block text-xs mb-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>宿題</label>
+        <textarea value={entry.homework} onChange={update("homework")} rows={2} placeholder="例）ワークP32〜35" className="w-full px-2 py-1.5 rounded text-sm resize-none" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+      </div>
+      <div className="mb-4">
+        <label className="block text-xs mb-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>来週の予定内容</label>
+        <textarea value={entry.nextContent} onChange={update("nextContent")} rows={2} placeholder="例）三平方の定理の導入" className="w-full px-2 py-1.5 rounded text-sm resize-none" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+      </div>
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="flex items-center gap-1 px-3 py-1.5 rounded text-sm" style={{ color: PALETTE.inkSoft, ...FONT_JP }}><Icon size={14}>✖️</Icon> キャンセル</button>
+        <button onClick={() => onSave(entry)} disabled={!entry.date} className="flex items-center gap-1 px-4 py-1.5 rounded text-sm text-white disabled:opacity-40" style={{ background: accent, ...FONT_JP }}><Icon size={14}>✅</Icon> 保存</button>
+      </div>
+    </div>
+  );
+}
+
+function EntryCard({ entry, accent, onEdit, onDelete }) {
+  return (
+    <div className="rounded-lg p-4 mb-3" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}`, borderLeft: `4px solid ${accent}` }}>
+      <div className="flex items-start justify-between mb-2">
+        <span className="text-sm font-bold" style={{ color: PALETTE.ink, ...FONT_MINCHO }}>{formatDateJP(entry.date)}</span>
+        <div className="flex gap-1">
+          <button onClick={() => onEdit(entry)} style={{ color: PALETTE.inkSoft }} className="p-1"><Icon size={14}>✏️</Icon></button>
+          <button onClick={() => onDelete(entry.id)} style={{ color: PALETTE.stamp }} className="p-1"><Icon size={14}>🗑️</Icon></button>
+        </div>
+      </div>
+      <div className="space-y-1.5" style={FONT_JP}>
+        {entry.content && <div className="text-sm"><span className="text-xs mr-2" style={{ color: PALETTE.inkSoft }}>授業内容</span><span style={{ color: PALETTE.ink }}>{entry.content}</span></div>}
+        {entry.homework && <div className="text-sm"><span className="text-xs mr-2" style={{ color: PALETTE.inkSoft }}>宿題</span><span style={{ color: PALETTE.ink }}>{entry.homework}</span></div>}
+        {entry.nextContent && <div className="text-sm"><span className="text-xs mr-2" style={{ color: PALETTE.gold }}>来週の予定</span><span style={{ color: PALETTE.ink }}>{entry.nextContent}</span></div>}
+      </div>
+    </div>
+  );
+}
+
+function TestResultForm({ initial, accent, onSave, onCancel }) {
+  const [result, setResult] = useState(initial);
+  const updateField = (field) => (e) => setResult((prev) => ({ ...prev, [field]: e.target.value }));
+  const updateSubject = (id, field) => (e) => setResult((prev) => ({ ...prev, subjects: prev.subjects.map((s) => (s.id === id ? { ...s, [field]: e.target.value } : s)) }));
+  const addSubject = () => setResult((prev) => ({ ...prev, subjects: [...prev.subjects, emptySubject()] }));
+  const removeSubject = (id) => setResult((prev) => ({ ...prev, subjects: prev.subjects.filter((s) => s.id !== id) }));
+  const canSave = result.name.trim() && result.date && result.subjects.some((s) => s.name.trim() && s.score !== "");
+
+  return (
+    <div className="rounded-lg p-4 mb-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div>
+          <label className="block text-xs mb-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>テスト名</label>
+          <input type="text" value={result.name} onChange={updateField("name")} placeholder="例）第1回模試" className="w-full px-2 py-1.5 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+        </div>
+        <div>
+          <label className="block text-xs mb-1" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>実施日</label>
+          <input type="date" value={result.date} onChange={updateField("date")} className="w-full px-2 py-1.5 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+        </div>
+      </div>
+      <label className="block text-xs mb-2" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>科目別の得点</label>
+      <div className="space-y-3 mb-3">
+        {result.subjects.map((s) => (
+          <div key={s.id} className="rounded-md p-2.5" style={{ border: `1px solid ${PALETTE.line}` }}>
+            <div className="flex items-center gap-2 mb-2">
+              <input type="text" value={s.name} onChange={updateSubject(s.id, "name")} placeholder="科目名" className="flex-1 px-2 py-1.5 rounded text-sm min-w-0" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+              <input type="number" value={s.score} onChange={updateSubject(s.id, "score")} placeholder="得点" className="w-20 px-2 py-1.5 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+              <span className="text-xs" style={{ color: PALETTE.inkSoft }}>/</span>
+              <input type="number" value={s.maxScore} onChange={updateSubject(s.id, "maxScore")} placeholder="満点" className="w-20 px-2 py-1.5 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+              <button onClick={() => removeSubject(s.id)} disabled={result.subjects.length <= 1} className="p-1 disabled:opacity-30" style={{ color: PALETTE.stamp }}><Icon size={14}>🗑️</Icon></button>
+            </div>
+            <input type="text" value={s.topic} onChange={updateSubject(s.id, "topic")} placeholder="苦手だった範囲・単元（任意、例：二次方程式の文章題）" className="w-full px-2 py-1.5 rounded text-xs" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+          </div>
+        ))}
+      </div>
+      <button onClick={addSubject} className="flex items-center gap-1 text-xs mb-4" style={{ color: accent, ...FONT_JP }}><Icon size={13}>➕</Icon> 科目を追加</button>
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="flex items-center gap-1 px-3 py-1.5 rounded text-sm" style={{ color: PALETTE.inkSoft, ...FONT_JP }}><Icon size={14}>✖️</Icon> キャンセル</button>
+        <button onClick={() => onSave(result)} disabled={!canSave} className="flex items-center gap-1 px-4 py-1.5 rounded text-sm text-white disabled:opacity-40" style={{ background: accent, ...FONT_JP }}><Icon size={14}>✅</Icon> 保存</button>
+      </div>
+    </div>
+  );
+}
+
+function TestResultAnalysis({ result, onEdit, onDelete, onGenerateAdvice, hasApiKey }) {
+  const [loadingId, setLoadingId] = useState(null);
+  const [errorId, setErrorId] = useState(null);
+  const rows = result.subjects.filter((s) => s.name.trim()).map((s) => ({ ...s, pct: pct(s.score, s.maxScore) })).filter((s) => s.pct !== null);
+  const weakRows = rows.filter((r) => levelFor(r.pct) === "weak").sort((a, b) => a.pct - b.pct);
+  const strongRows = rows.filter((r) => levelFor(r.pct) === "strong").sort((a, b) => b.pct - a.pct);
+  const avg = rows.length ? Math.round((rows.reduce((sum, r) => sum + r.pct, 0) / rows.length) * 10) / 10 : null;
+
+  const handleGenerate = async (subject) => {
+    setLoadingId(subject.id); setErrorId(null);
+    try {
+      const advice = await fetchTopicAdvice({ subjectName: subject.name, topic: subject.topic, pctValue: subject.pct, score: subject.score, maxScore: subject.maxScore });
+      onGenerateAdvice(result.id, subject.id, advice);
+    } catch (e) { setErrorId(subject.id); } finally { setLoadingId(null); }
+  };
+
+  return (
+    <div className="rounded-lg p-4 mb-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <div className="text-sm font-bold" style={{ color: PALETTE.ink, ...FONT_MINCHO }}>{result.name}</div>
+          <div className="text-xs" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>{formatDateJP(result.date)}{avg !== null && `・平均 ${avg}%`}</div>
+        </div>
+        <div className="flex gap-1">
+          <button onClick={() => onEdit(result)} style={{ color: PALETTE.inkSoft }} className="p-1"><Icon size={14}>✏️</Icon></button>
+          <button onClick={() => onDelete(result.id)} style={{ color: PALETTE.stamp }} className="p-1"><Icon size={14}>🗑️</Icon></button>
+        </div>
+      </div>
+      <div className="space-y-2 mb-4">
+        {rows.map((r) => {
+          const level = levelFor(r.pct), meta = LEVEL_META[level];
+          return (
+            <div key={r.id}>
+              <div className="flex items-center justify-between text-xs mb-1" style={FONT_JP}>
+                <span style={{ color: PALETTE.ink }} className="font-medium">{r.name}</span>
+                <span style={{ color: meta.color }} className="flex items-center gap-1"><Icon size={12}>{meta.emoji}</Icon> {r.pct}%（{r.score}/{r.maxScore}）</span>
+              </div>
+              <div className="w-full h-2 rounded-full" style={{ background: PALETTE.line }}>
+                <div className="h-2 rounded-full" style={{ width: `${Math.min(r.pct, 100)}%`, background: meta.color }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {(weakRows.length > 0 || strongRows.length > 0) && (
+        <div className="space-y-2">
+          {weakRows.map((r) => (
+            <div key={r.id} className="rounded-md p-2.5 text-xs" style={{ background: LEVEL_META.weak.soft, ...FONT_JP }}>
+              <div className="flex items-center gap-1 font-bold mb-0.5" style={{ color: LEVEL_META.weak.color }}><Icon size={12}>⚠️</Icon> 苦手：{r.name}</div>
+              {r.topic && r.topic.trim() ? (
+                <>
+                  <div className="mb-1" style={{ color: PALETTE.inkSoft }}>苦手な範囲：{r.topic}</div>
+                  <div className="whitespace-pre-wrap" style={{ color: PALETTE.ink }}>{r.aiAdvice && r.aiAdvice.trim() ? r.aiAdvice : adviceFor(r.pct)}</div>
+                  {hasApiKey ? (
+                    <button onClick={() => handleGenerate(r)} disabled={loadingId === r.id} className="flex items-center gap-1 mt-1.5 disabled:opacity-50" style={{ color: LEVEL_META.weak.color }}>
+                      <Icon size={12}>✨</Icon> {loadingId === r.id ? "対策を提案中..." : (r.aiAdvice && r.aiAdvice.trim() ? "対策を再提案" : "この範囲の対策をAIに提案してもらう")}
+                    </button>
+                  ) : (
+                    <div className="mt-1" style={{ color: PALETTE.inkSoft }}>※ 設定画面でAnthropicのAPIキーを登録すると、この範囲専用の対策をAIが提案します。</div>
+                  )}
+                  {errorId === r.id && <div className="mt-1" style={{ color: PALETTE.stamp }}>提案の取得に失敗しました。APIキーを確認してもう一度お試しください。</div>}
+                </>
+              ) : (
+                <div style={{ color: PALETTE.ink }}>{adviceFor(r.pct)}</div>
+              )}
+            </div>
+          ))}
+          {strongRows.map((r) => (
+            <div key={r.id} className="rounded-md p-2.5 text-xs" style={{ background: LEVEL_META.strong.soft, ...FONT_JP }}>
+              <div className="flex items-center gap-1 font-bold mb-0.5" style={{ color: LEVEL_META.strong.color }}><Icon size={12}>👍</Icon> 得意：{r.name}</div>
+              <div style={{ color: PALETTE.ink }}>{adviceFor(r.pct)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* self-contained SVG line chart — no external chart library */
+function ScoreTrendChart({ testResults }) {
+  const sorted = useMemo(() => [...testResults].sort((a, b) => (a.date < b.date ? -1 : 1)), [testResults]);
+  const subjectNames = useMemo(() => {
+    const set = new Set();
+    sorted.forEach((t) => t.subjects.forEach((s) => s.name.trim() && set.add(s.name.trim())));
+    return Array.from(set);
+  }, [sorted]);
+  const chartData = useMemo(() => sorted.map((t) => {
+    const point = { test: t.name || formatDateJP(t.date) };
+    t.subjects.forEach((s) => { if (!s.name.trim()) return; const p = pct(s.score, s.maxScore); if (p !== null) point[s.name.trim()] = p; });
+    return point;
+  }), [sorted]);
+
+  if (sorted.length < 2 || subjectNames.length === 0) {
+    return <div className="text-center py-8 text-sm rounded-lg mb-4" style={{ color: PALETTE.inkSoft, border: `1px dashed ${PALETTE.line}`, ...FONT_JP }}>テスト結果を2件以上登録すると、成績の推移グラフが表示されます。</div>;
+  }
+
+  const width = 600, height = 220, padL = 32, padR = 12, padT = 10, padB = 34;
+  const plotW = width - padL - padR, plotH = height - padT - padB;
+  const xStep = chartData.length > 1 ? plotW / (chartData.length - 1) : 0;
+  const xScale = (i) => padL + i * xStep;
+  const yScale = (p) => padT + plotH - (p / 100) * plotH;
+  const gridLines = [0, 25, 50, 75, 100];
+
+  return (
+    <div className="rounded-lg p-4 mb-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+      <div className="text-xs mb-3 font-bold" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>科目別 成績推移（%）</div>
+      <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto" }}>
+        {gridLines.map((g) => (
+          <g key={g}>
+            <line x1={padL} x2={width - padR} y1={yScale(g)} y2={yScale(g)} stroke={PALETTE.line} strokeWidth="1" />
+            <text x={padL - 6} y={yScale(g) + 3} fontSize="9" textAnchor="end" fill={PALETTE.inkSoft} fontFamily="'Noto Sans JP', sans-serif">{g}</text>
+          </g>
+        ))}
+        {chartData.map((d, i) => (
+          <text key={i} x={xScale(i)} y={height - 10} fontSize="9" textAnchor="middle" fill={PALETTE.inkSoft} fontFamily="'Noto Sans JP', sans-serif">{d.test.length > 8 ? d.test.slice(0, 8) + "…" : d.test}</text>
+        ))}
+        {subjectNames.map((name, si) => {
+          const color = SUBJECT_COLORS[si % SUBJECT_COLORS.length];
+          const pts = chartData.map((d, i) => (d[name] !== undefined ? { x: xScale(i), y: yScale(d[name]) } : null)).filter(Boolean);
+          return (
+            <g key={name}>
+              <polyline points={pts.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth="2" />
+              {pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r="3" fill={color} />)}
+            </g>
+          );
+        })}
+      </svg>
+      <div className="flex flex-wrap gap-3 mt-2">
+        {subjectNames.map((name, i) => (
+          <div key={name} className="flex items-center gap-1 text-xs" style={{ color: PALETTE.ink, ...FONT_JP }}>
+            <span style={{ width: 8, height: 8, borderRadius: 9999, background: SUBJECT_COLORS[i % SUBJECT_COLORS.length], display: "inline-block" }} />
+            {name}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({ onClose, accent }) {
+  const [key, setKey] = useState(getApiKey());
+  const [saved, setSaved] = useState(false);
+  return (
+    <div className="rounded-lg p-4 mb-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+      <div className="text-sm font-bold mb-2" style={{ color: PALETTE.ink, ...FONT_JP }}>設定：Anthropic APIキー</div>
+      <div className="text-xs mb-3" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>
+        「苦手な範囲の対策をAIに提案してもらう」機能に使います。キーはこのブラウザの localStorage にのみ保存され、外部には送信されません（Anthropic API 以外には）。
+        <b> ただしブラウザの開発者ツールからは見える状態になるため、個人利用にとどめ、このサイトを不特定多数に公開する場合はキーを登録しないことをおすすめします。</b>
+      </div>
+      <input type="password" value={key} onChange={(e) => { setKey(e.target.value); setSaved(false); }} placeholder="sk-ant-..." className="w-full px-2 py-1.5 rounded text-sm mb-3" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+      <div className="flex justify-end gap-2">
+        <button onClick={onClose} className="px-3 py-1.5 rounded text-sm" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>閉じる</button>
+        <button onClick={() => { setApiKey(key.trim()); setSaved(true); }} className="px-4 py-1.5 rounded text-sm text-white" style={{ background: accent, ...FONT_JP }}>保存</button>
+      </div>
+      {saved && <div className="text-xs mt-2" style={{ color: PALETTE.good, ...FONT_JP }}>保存しました。</div>}
+    </div>
+  );
+}
+
+/* ---------- main app ---------- */
+function App() {
+  const [mode, setMode] = useState("normal");
+  const [subTab, setSubTab] = useState("log");
+  const [data, setData] = useState({ normal: loadMode("normal"), summer: loadMode("summer") });
+  const [selectedClassId, setSelectedClassId] = useState(null);
+  const [selectedStudentId, setSelectedStudentId] = useState(null);
+  const [formState, setFormState] = useState(null);
+  const [testFormState, setTestFormState] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [hasApiKey, setHasApiKey] = useState(!!getApiKey());
+
+  const current = data[mode];
+  const accent = MODES[mode].accent;
+
+  useEffect(() => {
+    if (!current) return;
+    if (!current.classes.find((c) => c.id === selectedClassId)) setSelectedClassId(current.classes[0]?.id ?? null);
+    // eslint-disable-next-line
+  }, [mode, current]);
+
+  const selectedClass = current?.classes.find((c) => c.id === selectedClassId) ?? null;
+
+  useEffect(() => {
+    if (!selectedClass) { setSelectedStudentId(null); return; }
+    if (!selectedClass.students.find((s) => s.id === selectedStudentId)) setSelectedStudentId(selectedClass.students[0]?.id ?? null);
+    // eslint-disable-next-line
+  }, [selectedClassId, selectedClass]);
+
+  const updateCurrent = useCallback((updater) => {
+    setData((prev) => { const next = { ...prev, [mode]: updater(prev[mode]) }; saveMode(mode, next[mode]); return next; });
+  }, [mode]);
+  const updateClass = useCallback((classId, updater) => {
+    updateCurrent((modeData) => ({ ...modeData, classes: modeData.classes.map((c) => (c.id === classId ? updater(c) : c)) }));
+  }, [updateCurrent]);
+
+  const addClass = (name) => { const c = emptyClass(name); updateCurrent((m) => ({ ...m, classes: [...m.classes, c] })); setSelectedClassId(c.id); };
+  const renameClass = (id, name) => updateClass(id, (c) => ({ ...c, name }));
+  const deleteClass = (id) => updateCurrent((m) => ({ ...m, classes: m.classes.filter((c) => c.id !== id) }));
+
+  const addStudent = (name) => { const s = emptyStudent(name); updateClass(selectedClassId, (c) => ({ ...c, students: [...c.students, s] })); setSelectedStudentId(s.id); };
+  const renameStudent = (id, name) => updateClass(selectedClassId, (c) => ({ ...c, students: c.students.map((s) => (s.id === id ? { ...s, name } : s)) }));
+  const deleteStudent = (id) => updateClass(selectedClassId, (c) => ({ ...c, students: c.students.filter((s) => s.id !== id), testResults: c.testResults.filter((t) => t.studentId !== id) }));
+
+  const handleSaveEntry = (entry) => {
+    updateClass(selectedClassId, (c) => { const exists = c.entries.some((e) => e.id === entry.id); return { ...c, entries: exists ? c.entries.map((e) => (e.id === entry.id ? entry : e)) : [...c.entries, entry] }; });
+    setFormState(null);
+  };
+  const handleDeleteEntry = (id) => updateClass(selectedClassId, (c) => ({ ...c, entries: c.entries.filter((e) => e.id !== id) }));
+
+  const handleSaveTestResult = (result) => {
+    updateClass(selectedClassId, (c) => { const exists = c.testResults.some((t) => t.id === result.id); return { ...c, testResults: exists ? c.testResults.map((t) => (t.id === result.id ? result : t)) : [...c.testResults, result] }; });
+    setTestFormState(null);
+  };
+  const handleDeleteTestResult = (id) => updateClass(selectedClassId, (c) => ({ ...c, testResults: c.testResults.filter((t) => t.id !== id) }));
+  const handleGenerateAdvice = (resultId, subjectId, advice) => {
+    updateClass(selectedClassId, (c) => ({ ...c, testResults: c.testResults.map((t) => (t.id === resultId ? { ...t, subjects: t.subjects.map((s) => (s.id === subjectId ? { ...s, aiAdvice: advice } : s)) } : t)) }));
+  };
+
+  const handleTestDateChange = (e) => updateClass(selectedClassId, (c) => ({ ...c, testDate: e.target.value }));
+  const handleTestLabelChange = (e) => updateClass(selectedClassId, (c) => ({ ...c, testLabel: e.target.value }));
+
+  const sortedEntries = useMemo(() => selectedClass ? [...selectedClass.entries].sort((a, b) => (a.date < b.date ? 1 : -1)) : [], [selectedClass]);
+  const studentTestResults = useMemo(() => selectedClass && selectedStudentId ? selectedClass.testResults.filter((t) => t.studentId === selectedStudentId) : [], [selectedClass, selectedStudentId]);
+  const sortedTestResults = useMemo(() => [...studentTestResults].sort((a, b) => (a.date < b.date ? 1 : -1)), [studentTestResults]);
+
+  return (
+    <div className="min-h-screen" style={{ background: PALETTE.paper }}>
+      <div style={{ background: PALETTE.ink }} className="px-5 pt-6 pb-0">
+        <div className="flex items-center justify-between mb-4">
+          <h1 className="text-white text-xl flex items-center gap-2" style={FONT_MINCHO}>塾講師ノート</h1>
+          <button onClick={() => setShowSettings((v) => !v)} className="text-white/70 text-xs flex items-center gap-1" style={FONT_JP}><Icon size={14}>⚙️</Icon> 設定</button>
+        </div>
+        <div className="flex gap-1">
+          {Object.entries(MODES).map(([key, m]) => {
+            const isActive = key === mode;
+            return (
+              <button key={key} onClick={() => { setMode(key); setSubTab("log"); setFormState(null); setTestFormState(null); }}
+                className="flex items-center gap-1.5 px-4 py-2.5 text-sm rounded-t-lg"
+                style={{ background: isActive ? PALETTE.paper : "transparent", color: isActive ? m.accent : "rgba(255,255,255,0.65)", ...FONT_JP, fontWeight: isActive ? 700 : 400 }}>
+                <Icon size={15}>{m.emoji}</Icon>{m.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="max-w-2xl mx-auto px-5 py-5">
+        {showSettings && <SettingsPanel accent={accent} onClose={() => { setShowSettings(false); setHasApiKey(!!getApiKey()); }} />}
+
+        <div className="text-xs mb-2 flex items-center gap-1.5" style={{ color: PALETTE.inkSoft, ...FONT_JP }}><Icon size={13}>👥</Icon> クラス</div>
+        <EntityChipRow items={current.classes} selectedId={selectedClassId}
+          onSelect={(id) => { setSelectedClassId(id); setFormState(null); setTestFormState(null); }}
+          onAdd={addClass} onRename={renameClass} onDelete={deleteClass} accent={accent}
+          addLabel="クラスを追加" emptyHint="まずはクラスを追加してください（例：中3A、高1数学）。" />
+
+        {selectedClass ? (
+          <>
+            <div className="rounded-lg p-4 mb-5 flex items-center justify-between gap-4" style={{ background: PALETTE.paperCard, border: `1px solid ${PALETTE.line}` }}>
+              <div className="flex-1">
+                <div className="flex items-center gap-1.5 mb-2" style={{ color: PALETTE.inkSoft }}><Icon size={14}>📅</Icon><span className="text-xs" style={FONT_JP}>{selectedClass.name}のテスト</span></div>
+                <input type="text" value={selectedClass.testLabel} onChange={handleTestLabelChange} placeholder="テスト名（例：夏期講習修了テスト）" className="w-full mb-2 px-2 py-1 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+                <input type="date" value={selectedClass.testDate} onChange={handleTestDateChange} className="px-2 py-1 rounded text-sm" style={{ border: `1px solid ${PALETTE.line}`, ...FONT_JP }} />
+                {selectedClass.testDate && <div className="text-xs mt-2" style={{ color: PALETTE.inkSoft, ...FONT_JP }}>{formatDateJP(selectedClass.testDate)}{selectedClass.testLabel ? `・${selectedClass.testLabel}` : ""}</div>}
+              </div>
+              <CountdownStamp dateStr={selectedClass.testDate} accent={accent} />
+            </div>
+
+            <div className="flex gap-1 mb-5 rounded-lg p-1" style={{ background: MODES[mode].soft }}>
+              <button onClick={() => setSubTab("log")} className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-sm" style={{ background: subTab === "log" ? PALETTE.paperCard : "transparent", color: subTab === "log" ? accent : PALETTE.inkSoft, fontWeight: subTab === "log" ? 700 : 400, ...FONT_JP }}><Icon size={14}>📝</Icon> 授業記録</button>
+              <button onClick={() => setSubTab("analysis")} className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-sm" style={{ background: subTab === "analysis" ? PALETTE.paperCard : "transparent", color: subTab === "analysis" ? accent : PALETTE.inkSoft, fontWeight: subTab === "analysis" ? 700 : 400, ...FONT_JP }}><Icon size={14}>📈</Icon> 成績分析</button>
+            </div>
+
+            {subTab === "log" && (
+              <>
+                {formState === null ? (
+                  <button onClick={() => setFormState(emptyEntry())} className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-lg mb-4 text-sm text-white" style={{ background: accent, ...FONT_JP }}><Icon size={16}>➕</Icon> 授業記録を追加</button>
+                ) : <EntryForm initial={formState} accent={accent} onSave={handleSaveEntry} onCancel={() => setFormState(null)} />}
+                {sortedEntries.length === 0 ? (
+                  <div className="text-center py-10 text-sm rounded-lg" style={{ color: PALETTE.inkSoft, border: `1px dashed ${PALETTE.line}`, ...FONT_JP }}>まだ記録がありません。「授業記録を追加」から入力してください。</div>
+                ) : sortedEntries.map((entry) => <EntryCard key={entry.id} entry={entry} accent={accent} onEdit={(e) => setFormState(e)} onDelete={handleDeleteEntry} />)}
+              </>
+            )}
+
+            {subTab === "analysis" && (
+              <>
+                <div className="text-xs mb-2 flex items-center gap-1.5" style={{ color: PALETTE.inkSoft, ...FONT_JP }}><Icon size={13}>👥</Icon> 生徒</div>
+                <EntityChipRow items={selectedClass.students} selectedId={selectedStudentId}
+                  onSelect={(id) => { setSelectedStudentId(id); setTestFormState(null); }}
+                  onAdd={addStudent} onRename={renameStudent} onDelete={deleteStudent} accent={accent}
+                  addLabel="生徒を追加" emptyHint="生徒を追加すると、生徒ごとの成績を記録できます。" />
+
+                {selectedStudentId && (
+                  <>
+                    {testFormState === null ? (
+                      <button onClick={() => setTestFormState(emptyTestResult(selectedStudentId))} className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-lg mb-4 text-sm text-white" style={{ background: accent, ...FONT_JP }}><Icon size={16}>➕</Icon> テスト結果を追加</button>
+                    ) : <TestResultForm initial={testFormState} accent={accent} onSave={handleSaveTestResult} onCancel={() => setTestFormState(null)} />}
+                    {sortedTestResults.length === 0 ? (
+                      <div className="text-center py-10 text-sm rounded-lg" style={{ color: PALETTE.inkSoft, border: `1px dashed ${PALETTE.line}`, ...FONT_JP }}>まだテスト結果がありません。「テスト結果を追加」から科目別の得点を入力してください。</div>
+                    ) : (
+                      <>
+                        <ScoreTrendChart testResults={sortedTestResults} />
+                        {sortedTestResults.map((result) => (
+                          <TestResultAnalysis key={result.id} result={result} onEdit={(r) => setTestFormState(r)} onDelete={handleDeleteTestResult} onGenerateAdvice={handleGenerateAdvice} hasApiKey={hasApiKey} />
+                        ))}
+                      </>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+          </>
+        ) : (
+          <div className="text-center py-14 text-sm rounded-lg" style={{ color: PALETTE.inkSoft, border: `1px dashed ${PALETTE.line}`, ...FONT_JP }}>クラスを追加すると、授業記録と成績分析を始められます。</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+<script>
+  var code = document.getElementById("app-source").textContent;
+  var output = Babel.transform(code, { presets: [["react", { runtime: "classic" }]] }).code;
+  var script = document.createElement("script");
+  script.text = output;
+  document.body.appendChild(script);
+</script>
+</body>
+</html>
